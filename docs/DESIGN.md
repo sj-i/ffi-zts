@@ -146,3 +146,100 @@ The loader (current `ffi-zts.php`, destined to become
   display, etc.).
 - Owning lifetimes of C strings and callback closures for the
   duration of the embed.
+
+## 5. Extension loading strategy
+
+### 5.1 Two categories of extensions
+
+ZTS extensions used from the embed fall into two categories that want
+opposite defaults:
+
+| Category | Example | Release coupling to PHP core | Default strategy |
+| --- | --- | --- | --- |
+| Bundled (shipped inside php-src) | `opcache`, `mbstring`, `pcre`, `spl`, `reflection`, `json`, `date`, `ffi`, `standard` | Fully synchronised with PHP minor release | **Statically linked into `libphp.so`** |
+| External (PECL / third-party) | `parallel` | Independent version, but ABI-bound to PHP minor in practice | **Shared `.so`, ELF-patched, loaded by the embed** |
+
+### 5.2 Static bundling of core + opcache
+
+Bundled extensions are compiled into `libphp.so` at build time
+(`--enable-opcache` without `=shared`, etc.). This removes the need
+for any per-extension symbol-resolution workaround:
+
+- Their references to the Zend runtime are resolved inside
+  `libphp.so` at link time.
+- With `RTLD_DEEPBIND` on `libphp.so`, those references stay inside
+  the library at runtime regardless of what the host exports.
+- `opcache.preload` becomes a natural fit: a long-lived embed
+  preloads a domain kernel once, and every subsequent
+  `parallel\Runtime` worker thread inherits the preloaded classes
+  and functions for free (OPcache SHM is process-wide in ZTS mode).
+
+OPcache SHM segments for the NTS host and the embedded ZTS do not
+collide: on Linux they default to anonymous `mmap` mappings that are
+inherently per-process region, and the bytecode layout is ABI-specific
+so sharing would be incorrect anyway.
+
+### 5.3 Dynamic loading of external extensions
+
+A naive `extension=parallel.so` in the embed's `ini_entries` fails
+because stock `parallel.so` has no `DT_NEEDED libphp.so`. Under
+`RTLD_DEEPBIND`, the symbols it needs (e.g.
+`zend_register_internal_class_with_flags`) fall through to the host
+NTS binary and segfault during `MINIT`.
+
+The fix is to ensure `parallel.so` declares `libphp.so` as a
+`DT_NEEDED` dependency so DEEPBIND's per-library scope includes the
+ZTS core before falling through to global scope. This can be done at
+build time (`LDFLAGS="-lphp ..."`) or post-build via an ELF edit
+(`patchelf --add-needed libphp.so --set-rpath <libphp-dir>`).
+
+The same re-linked `parallel.so` is **not** usable under a
+self-contained native ZTS CLI -- loading `libphp.so` on top of a
+CLI that already contains its own Zend runtime double-registers
+everything and crashes. Two artefacts therefore need to coexist on
+disk in separate locations:
+
+- `extensions/no-debug-zts-<api>/parallel.so` -- vanilla, for native
+  ZTS CLI use.
+- `extensions/ffi-zts/parallel.so` -- `DT_NEEDED libphp.so` added,
+  for ffi-zts embed use only.
+
+### 5.4 ELF writer in pure PHP
+
+The ELF edit (adding `DT_NEEDED` + optionally `DT_RUNPATH`) is small
+enough that shipping a pure-PHP implementation inside `ffi-zts`
+avoids taking a hard dependency on the `patchelf` system tool and on
+a compiler toolchain. Scope:
+
+- ELF64 little-endian shared objects only (Linux x86_64 / aarch64).
+- Operations: append a new `PT_LOAD` segment that carries an extended
+  `.dynstr` and a rewritten `.dynamic`, insert `DT_NEEDED` before the
+  trailing `DT_NULL`, fix up program headers, optionally set
+  `DT_RUNPATH`.
+- Reader-side infrastructure can be shared with reliforp/reli-prof,
+  which already parses ELF headers, program headers, `.dynamic`, and
+  `.dynsym` via FFI-backed struct overlays. The net-new code is the
+  writer side plus the trailing `PT_LOAD` placement logic.
+
+### 5.5 Loader paths: disk cache vs `memfd_create`
+
+The patched `parallel.so` can be materialised two ways:
+
+1. **Disk cache (default).** Run the ELF patch at `composer install`
+   / `composer update` time (or via `vendor/bin/ffi-zts rebuild-cache`)
+   and write the result under `vendor/.../cache/parallel.so.patched`.
+   Runtime just `dlopen`s a regular file. Cache filenames embed
+   hashes of the input `.so`, the target `libphp.so`, and the
+   `ffi-zts` version to make invalidation deterministic.
+
+2. **`memfd_create` (override / read-only environments).** Perform
+   the ELF patch in memory, write the bytes to a memfd, and
+   `dlopen("/proc/self/fd/N", ...)`. No filesystem write is required.
+   This is the path for `FfiZts::boot()->withExtension('/path/my-parallel.so')`
+   -- runtime user overrides, read-only containers, forensic
+   sandboxes.
+
+Both paths share the same `patchElfBytes()` implementation; only the
+sink differs. Disk cache is the default for normal usage because it
+amortises the patch cost, is debuggable with `readelf`, and benefits
+from OS page cache sharing across FPM workers.
