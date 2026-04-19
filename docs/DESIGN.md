@@ -243,3 +243,85 @@ Both paths share the same `patchElfBytes()` implementation; only the
 sink differs. Disk cache is the default for normal usage because it
 amortises the patch cost, is debuggable with `readelf`, and benefits
 from OS page cache sharing across FPM workers.
+
+## 6. Distribution model
+
+### 6.1 Package split
+
+The library is distributed as two (or more) Composer packages:
+
+- `sj-i/ffi-zts` -- the core embed loader, libphp.so binary artefact,
+  and the ELF writer. Release cadence tracks the PHP minor version.
+- `sj-i/ffi-zts-parallel` -- the PHP-side wrapper around
+  `parallel\Runtime` plus a "reference" `parallel.so` binary artefact.
+  Release cadence tracks upstream `parallel` patch releases.
+
+Additional satellite packages (`sj-i/ffi-zts-<whatever>`) can be
+introduced as other external ZTS extensions become relevant.
+
+### 6.2 Composer wiring
+
+Satellite packages depend on the core package via a standard
+`require`:
+
+```json
+{
+    "name": "sj-i/ffi-zts-parallel",
+    "require": {
+        "php": ">=8.4,<8.5",
+        "ext-ffi": "*",
+        "sj-i/ffi-zts": "^1.0"
+    }
+}
+```
+
+The PHP version constraint ties the install to the matching libphp.so
+ABI, and the `ext-ffi` constraint ensures the host is actually
+capable of running the loader.
+
+### 6.3 Binary delivery
+
+Large binary artefacts (libphp.so ~34 MB, patched extension `.so`s)
+do not ship inside the Composer package itself. Instead, each
+package runs a post-install script that fetches the correct
+pre-built tarball from GitHub Releases based on the host's PHP
+version, CPU architecture, and libc variant:
+
+```json
+"scripts": {
+    "post-install-cmd": "SjI\\FfiZts\\Installer::fetchBinaries",
+    "post-update-cmd":  "SjI\\FfiZts\\Installer::fetchBinaries"
+}
+```
+
+The installer detects the environment, downloads once, verifies
+checksums, runs the ELF patch if the package ships a stock `.so` that
+needs one, and writes the resulting artefacts under
+`vendor/sj-i/ffi-zts{,-parallel}/bin/`. This is the same pattern that
+puppeteer-php and chromedriver distribution-helpers already use.
+
+### 6.4 Versioning policy
+
+- **Major** of `ffi-zts` is bumped only when the target PHP minor
+  changes. `ffi-zts 1.x` = PHP 8.4; `ffi-zts 2.x` = PHP 8.5; and so
+  on.
+- **Minor/patch** of `ffi-zts` covers PHP patch releases (e.g.
+  PHP 8.4.19 -> 8.4.20), bug fixes in the loader, and ELF writer
+  improvements.
+- **Minor/patch** of `ffi-zts-parallel` covers upstream `parallel`
+  patch/minor releases and wrapper-side fixes. It may ship on a
+  different cadence than the core package.
+
+A user who just wants to pick up a `parallel` bug fix runs
+`composer update sj-i/ffi-zts-parallel`; the core package stays
+pinned. A user who upgrades to a new PHP minor updates the PHP
+version constraint and bumps both packages.
+
+### 6.5 Platform coverage (v1)
+
+- Linux x86_64 (glibc 2.31+)
+- Linux aarch64 (glibc 2.31+)
+
+musl and non-Linux targets are out of scope for v1. macOS and
+Windows in particular need a different embed approach entirely
+(Mach-O / PE have no DEEPBIND equivalent, memfd semantics differ).
