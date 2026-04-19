@@ -325,3 +325,132 @@ version constraint and bumps both packages.
 musl and non-Linux targets are out of scope for v1. macOS and
 Windows in particular need a different embed approach entirely
 (Mach-O / PE have no DEEPBIND equivalent, memfd semantics differ).
+
+## 7. Performance characteristics
+
+### 7.1 Where FFI overhead occurs, and where it does not
+
+FFI is used exclusively at the NTS <-> ZTS boundary. The hot path
+inside the embed (opcode execution, `parallel\Runtime` scheduling,
+worker thread code) is plain native ZTS PHP with no FFI involvement.
+
+| Event | FFI involved? | Approximate cost |
+| --- | --- | --- |
+| `dlopen(libphp.so)` + module startup | yes (one-time) | ~150-200 ms, dominated by `php_module_startup`; libffi trampoline cost is sub-microsecond and negligible |
+| Per-request `php_request_startup` / `_shutdown` | yes | a few microseconds |
+| `php_execute_script` | yes (invocation only) | microseconds to invoke; then pure native cost for the script body |
+| SAPI callbacks (`ub_write`, `log_message`, ...) | yes | microseconds per invocation; effectively free unless the embed writes huge volumes of output through `ub_write` |
+| `parallel\Runtime` spawn (first) | no | ~5-15 ms (pthread_create + TSRM allocation + parallel bootstrap) |
+| `parallel\Runtime` spawn (reused Runtime, subsequent task) | no | microseconds |
+| Zend opcode execution inside embed | no | identical to native ZTS |
+
+The measured end-to-end time for `hello.php` + 4-worker
+`test-parallel.php` through the current loader is ~217 ms, of which
+roughly 180 ms is one-time embed bring-up and the remainder is the
+parallel thread work (largely overlapped).
+
+### 7.2 Comparison with `pcntl_fork`
+
+| Dimension | `pcntl_fork` | ffi-zts + parallel |
+| --- | --- | --- |
+| Spawn cost | tens of microseconds to low milliseconds; grows with parent's page-table size | pthread_create (microseconds) + TSRM init (milliseconds on first runtime, reusable thereafter) |
+| State inheritance | entire parent via CoW (including live DB connections, which is hazardous) | clean ZTS context; explicit closure + argv passing |
+| Shared memory | CoW until written; explicit sharing requires SysV/mmap | same address space; FFI buffers shareable by address (zero-copy) |
+| Crash isolation | child death does not kill parent | thread death kills the whole process |
+| One-time startup cost | 0 (host PHP already running) | ~150-200 ms embed bring-up |
+| Per-task steady-state cost | one fork + IPC per task | one `Runtime::run()` per task; sub-ms on a reused Runtime |
+
+The two approaches have opposite cost curves. `pcntl_fork` wins for
+small numbers of independent jobs, especially those that need state
+the parent already has. ffi-zts wins once the embed startup amortises
+-- which happens quickly if the process stays alive long enough to
+run more than a few dozen short tasks, and immediately if the
+workload involves large inputs that `pcntl_fork`-based pipelines
+would have to IPC-serialise but that ffi-zts can share by address.
+
+## 8. Memory sharing model
+
+Because the outer NTS PHP and the embedded ZTS PHP live in the same
+address space, FFI buffers allocated outside Zend memory management
+can be shared between them by raw address. The standard
+`parallel\Runtime` closure-argument serialiser passes integers
+verbatim, so a buffer address cast to `intptr_t` crosses the
+thread boundary intact.
+
+Concretely:
+
+```php
+// Outer NTS
+$buf   = FFI::new('uint8_t[1048576]', owned: false);
+$addr  = FFI::cast('intptr_t', FFI::addr($buf))->cdata;
+
+// Inner ZTS, inside parallel\Runtime::run
+$ptr   = FFI::cast('uint8_t*', $addr);
+// ... reads and writes the same physical memory as the outer side
+```
+
+This bypasses `parallel`'s normal "parallel-safe type" restriction
+(which otherwise forces copies for anything non-trivial) and avoids
+ZendMM entirely, so there is no NTS-vs-ZTS allocator mixing.
+
+The caller carries three responsibilities:
+
+1. **Lifetime.** The outer side must keep the FFI buffer alive until
+   every worker that holds its address has joined; otherwise the
+   inner side is use-after-free.
+2. **Synchronisation.** Zero-copy does not imply data-race freedom.
+   Shared writes need explicit primitives (FFI-wrapped
+   `pthread_mutex_t` / `std::atomic` / `parallel\Channel` as a
+   notification boundary).
+3. **Type contract.** The outer and inner `FFI::cdef`s are
+   independent; the two sides must agree on the struct layout out of
+   band.
+
+This model is intended for plain byte buffers, numeric arrays, and
+POD structs. Stateful resources -- DB connections, `FILE*`, libcurl
+easy handles, open stream descriptors with userspace state -- are
+**not** safe to share across threads regardless of whether the
+sharing mechanism is zero-copy. Each worker must open its own
+connection (or check one out of a pool per task). This restriction
+is inherent to threading, not specific to ffi-zts.
+
+## 9. Open questions
+
+- **ELF writer scope.** Start with just `DT_NEEDED` + `DT_RUNPATH`
+  addition, or generalise earlier for other patch operations? Likely
+  start narrow, extract into a reusable `sj-i/php-elf` sub-package
+  only when a second consumer (e.g. reliforp/reli-prof) asks.
+- **memfd dlopen portability.** `dlopen("/proc/self/fd/N")` relies on
+  glibc behaviour that, while stable in practice, is not strictly
+  standardised. Worth benchmarking the cost of copying the patched
+  bytes to `$XDG_RUNTIME_DIR` (tmpfs) vs memfd as an alternative.
+- **CI coverage matrix.** PHP 8.4 x86_64 at launch; aarch64 and
+  PHP 8.5 preview matrices to add before v1. Each needs a
+  pre-built `libphp.so` and `parallel.so` tested under GitHub Actions
+  runners.
+- **Interaction with PHP-FPM.** Embed startup cost is amortised by
+  long-lived processes. FPM-with-always-reload (`pm = dynamic`
+  aggressive recycling) could negate the benefit. Recommend a
+  deployment note on keeping embed-using workers long-lived.
+- **Security posture.** Running ELF-edited shared objects is no
+  worse than running user-controlled Composer packages, but the ELF
+  writer's input validation (bounds checks, refusal to process
+  non-ELF files, resistance to crafted inputs) needs to be written
+  defensively.
+
+## 10. References
+
+- Spike implementation:
+  [`ffi-zts.php`](../ffi-zts.php),
+  [`examples/test-parallel.php`](../examples/test-parallel.php),
+  [`scripts/build-parallel.sh`](../scripts/build-parallel.sh).
+- Upstream inspiration:
+  [adsr/php-meta-sapi](https://github.com/adsr/php-meta-sapi)
+  and [issue #1](https://github.com/adsr/php-meta-sapi/issues/1).
+- Thread-safety extension:
+  [pecl/parallel](https://www.php.net/manual/en/book.parallel.php).
+- ELF reader infrastructure already used in-house:
+  [reliforp/reli-prof](https://github.com/reliforp/reli-prof).
+- `dlmopen` + libpthread limitations background:
+  glibc bugs in the 15971 / 20198 / 24776 series on
+  <https://sourceware.org/bugzilla/>.
