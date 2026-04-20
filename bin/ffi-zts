@@ -1,0 +1,111 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+// vendor-installed: vendor/sj-i/ffi-zts/bin/ffi-zts -> vendor/autoload.php
+// dev checkout:    bin/ffi-zts                     -> vendor/autoload.php
+foreach ([
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../../autoload.php',
+] as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+use SjI\FfiZts\Embed;
+use SjI\FfiZts\Config;
+use SjI\FfiZts\Extension\Extension;
+use SjI\FfiZts\FfiZts;
+use SjI\FfiZts\Installer;
+use SjI\FfiZts\Patch\DiskCacheSink;
+use SjI\FfiZts\Platform;
+use SjI\FfiZts\Elf\ElfPatcher;
+
+$cmd = $argv[1] ?? 'help';
+
+switch ($cmd) {
+    case 'install':
+    case 'download':
+        Installer::fetchBinaries();
+        break;
+
+    case 'info':
+        printf("php-abi      = %s\n", Platform::phpAbi());
+        printf("arch         = %s\n", Platform::arch());
+        printf("libc         = %s\n", Platform::libc());
+        printf("libphp.so    = %s%s\n", FfiZts::defaultLibphpPath(),
+            is_file(FfiZts::defaultLibphpPath()) ? '' : ' (missing -- run `ffi-zts install`)');
+        printf("cache dir    = %s\n", Installer::cacheDir());
+        break;
+
+    case 'patch-elf':
+        // ffi-zts patch-elf <input.so> <output.so> [--needed=lib.so]... [--runpath=DIR]
+        $needed  = [];
+        $runpath = null;
+        $positional = [];
+        for ($i = 2; $i < count($argv); $i++) {
+            $arg = $argv[$i];
+            if (str_starts_with($arg, '--needed=')) {
+                $needed[] = substr($arg, 9);
+            } elseif (str_starts_with($arg, '--runpath=')) {
+                $runpath = substr($arg, 10);
+            } else {
+                $positional[] = $arg;
+            }
+        }
+        if (count($positional) !== 2) {
+            fwrite(STDERR, "usage: ffi-zts patch-elf <input.so> <output.so> [--needed=lib.so]... [--runpath=DIR]\n");
+            exit(2);
+        }
+        ElfPatcher::patchFile($positional[0], $needed, $runpath, $positional[1]);
+        printf("patched: %s -> %s (needed=%s, runpath=%s)\n",
+            $positional[0], $positional[1],
+            implode(',', $needed) ?: '-', $runpath ?? '-');
+        break;
+
+    case 'rebuild-cache':
+        // intended hook for satellite packages to invalidate cached
+        // patched extensions (e.g. after a libphp.so refresh).
+        $dir = Installer::cacheDir();
+        if (is_dir($dir)) {
+            foreach (glob($dir . '/*') as $f) {
+                @unlink($f);
+            }
+        }
+        echo "cache cleared: {$dir}\n";
+        break;
+
+    case 'run':
+        $script = $argv[2] ?? null;
+        if ($script === null) {
+            fwrite(STDERR, "usage: ffi-zts run <script.php> [--ini=<file>]\n");
+            exit(2);
+        }
+        $embed = FfiZts::boot();
+        for ($i = 3; $i < count($argv); $i++) {
+            if (str_starts_with($argv[$i], '--ini=')) {
+                $embed = $embed->withIniFile(substr($argv[$i], 6));
+            }
+        }
+        $embed->runScript($script);
+        break;
+
+    case 'help':
+    case '--help':
+    case '-h':
+    default:
+        fwrite(STDERR, <<<TXT
+            ffi-zts -- embed a ZTS PHP interpreter inside an NTS host
+
+            usage:
+              ffi-zts install                                  fetch libphp.so for this host
+              ffi-zts info                                     show resolved platform / paths
+              ffi-zts run <script.php> [--ini=<file>]         run script inside the embed
+              ffi-zts patch-elf <in> <out> [--needed=lib]...  add DT_NEEDED / DT_RUNPATH
+              ffi-zts rebuild-cache                            clear the patched-extension cache
+
+            TXT);
+        exit($cmd === 'help' || $cmd === '--help' || $cmd === '-h' ? 0 : 2);
+}
