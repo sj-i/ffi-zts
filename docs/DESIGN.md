@@ -368,6 +368,10 @@ run more than a few dozen short tasks, and immediately if the
 workload involves large inputs that `pcntl_fork`-based pipelines
 would have to IPC-serialise but that ffi-zts can share by address.
 
+See [`PERFORMANCE.md`](PERFORMANCE.md) for measured fork-vs-embed
+numbers on a real 8.5.5 host; the reproducible bench scripts live
+under [`examples/bench/`](../examples/bench/).
+
 ## 8. Memory sharing model
 
 Because the outer NTS PHP and the embedded ZTS PHP live in the same
