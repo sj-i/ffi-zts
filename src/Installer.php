@@ -6,21 +6,26 @@ namespace SjI\FfiZts;
 use SjI\FfiZts\Exception\InstallException;
 
 /**
- * Composer post-install / post-update hook.
+ * Fetches the per-host libphp.so artefact into
+ * vendor/sj-i/ffi-zts/bin/.
+ *
+ * Normally invoked from SjI\FfiZts\ComposerPlugin in response to
+ * POST_PACKAGE_INSTALL / POST_PACKAGE_UPDATE. Also callable
+ * directly via `vendor/bin/ffi-zts install` for manual retries
+ * and for environments with plugins disabled (`--no-plugins`).
  *
  * Per docs/DESIGN.md §6.3, the libphp.so artefact (~34 MB) does
- * not ship inside the Composer package. After `composer install`,
- * this hook resolves the host's PHP minor + CPU arch + libc, then
- * downloads the matching pre-built tarball from GitHub Releases
- * and extracts it under vendor/sj-i/ffi-zts/bin/.
- *
- * The hook is idempotent: if libphp.so is already present, it
+ * not ship inside the Composer package; this hook resolves the
+ * host's PHP minor + CPU arch + libc, downloads the matching
+ * pre-built tarball from GitHub Releases, and extracts it. The
+ * hook is idempotent: if libphp.so is already present, it
  * returns immediately. To force a re-fetch, delete the bin/
- * directory and re-run `composer install`.
+ * directory and re-run install.
  *
- * Composer passes a `\Composer\Script\Event` to script handlers,
- * but we avoid a hard typehint so users without composer/composer
- * in their require-dev still load this file fine.
+ * Composer passes a `\Composer\Script\Event` (or
+ * `\Composer\Installer\PackageEvent`) to the plugin callback; we
+ * avoid a hard typehint so users without composer/composer in
+ * their require-dev still load this file fine.
  */
 final class Installer
 {
@@ -47,13 +52,30 @@ final class Installer
             throw new InstallException("unable to download release asset: {$url}");
         }
 
-        $tmp = tempnam(sys_get_temp_dir(), 'ffi-zts-');
-        @file_put_contents($tmp, $bytes);
+        // PharData detects the archive format from the file
+        // extension; tempnam() gives us a bare name, so attach
+        // .tar.gz before handing the path to PharData.
+        $tmpBase = tempnam(sys_get_temp_dir(), 'ffi-zts-');
+        if ($tmpBase === false) {
+            throw new InstallException('unable to allocate temp file for release archive');
+        }
+        $tmp = $tmpBase . '.tar.gz';
+        if (!@rename($tmpBase, $tmp)) {
+            @unlink($tmpBase);
+            throw new InstallException("unable to stage release archive at {$tmp}");
+        }
+        if (@file_put_contents($tmp, $bytes) === false) {
+            @unlink($tmp);
+            throw new InstallException("unable to write release archive to {$tmp}");
+        }
         try {
             $phar = new \PharData($tmp);
             $phar->extractTo($binDir, null, true);
         } catch (\Throwable $e) {
-            throw new InstallException("unable to extract release archive: " . $e->getMessage(), previous: $e);
+            throw new InstallException(
+                'unable to extract release archive: ' . $e->getMessage(),
+                previous: $e,
+            );
         } finally {
             @unlink($tmp);
         }
