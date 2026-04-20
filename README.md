@@ -14,18 +14,78 @@ embedded PHP to pick up ZTS extensions while the outer PHP stays NTS.
 
 The short answer is **yes**, with two small pieces of glue.
 
-## What's here
+## Install
 
-| Path | What |
-| --- | --- |
-| `ffi-zts.php`                 | NTS-hosted loader that brings up ZTS `libphp.so` via FFI and runs a script |
-| `examples/hello.php`          | Smoke test -- prints `PHP_ZTS`, `PHP_SAPI`, ... |
-| `examples/test-parallel.php`  | Spawns four `parallel\Runtime` workers and shows their results |
-| `examples/ffi-zts.ini`        | INI fragment fed to the embedded ZTS (`extension=parallel.so`) |
-| `scripts/build-zts-php.sh`    | Build ZTS PHP 8.4 with `--enable-embed` into `/home/user/php-zts` |
-| `scripts/build-parallel.sh`   | Build two `parallel.so`s: vanilla + FFI-linked |
+```sh
+composer require sj-i/ffi-zts
+```
 
-## Running
+`sj-i/ffi-zts` ships as a **Composer plugin**: on install it
+downloads the pre-built `libphp.so` matching your host's PHP
+minor / CPU arch / libc into `vendor/sj-i/ffi-zts/bin/libphp.so`.
+
+### Trusting the plugin
+
+Composer 2.2+ asks you to trust a new plugin before running it.
+In interactive shells you get a `(y/N)` prompt on first install.
+In CI / non-interactive environments, whitelist it up front:
+
+```sh
+composer config allow-plugins.sj-i/ffi-zts true
+composer require sj-i/ffi-zts
+```
+
+If you also install the `sj-i/ffi-zts-parallel` satellite, allow it
+too:
+
+```sh
+composer config allow-plugins.sj-i/ffi-zts true
+composer config allow-plugins.sj-i/ffi-zts-parallel true
+composer require sj-i/ffi-zts-parallel
+```
+
+### Manual install / retry
+
+If the plugin was skipped (`--no-plugins`, network outage, binary
+not yet published for a new PHP minor, ...), retry the binary fetch
+on demand:
+
+```sh
+vendor/bin/ffi-zts install
+```
+
+`vendor/bin/ffi-zts info` reports the resolved host profile and
+tells you whether the binary is in place.
+
+## Usage
+
+```php
+<?php
+require __DIR__ . '/vendor/autoload.php';
+
+use SjI\FfiZts\FfiZts;
+
+FfiZts::boot()
+    ->runScript(__DIR__ . '/worker.php');
+```
+
+`FfiZts::boot()` auto-resolves `vendor/sj-i/ffi-zts/bin/libphp.so`;
+`$worker.php` runs inside the embedded ZTS interpreter.
+
+For real OS-thread parallelism via `parallel\Runtime`, install the
+satellite package
+[`sj-i/ffi-zts-parallel`](https://github.com/sj-i/ffi-zts-parallel)
+instead -- it pulls in this core package transitively and wires
+`parallel.so` through the embed.
+
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the full architecture.
+
+## Experimental loader (`ffi-zts.php`)
+
+Before the library was packaged for Composer, the same mechanism
+lived in a single `ffi-zts.php` script. It still works and is the
+quickest way to inspect the ZTS embed end-to-end without composer
+involvement:
 
 ```sh
 # Host PHP is the system NTS build (e.g. /usr/bin/php).
@@ -53,7 +113,7 @@ worker id=3 pid=... sum=1999999000000 zts=1 took=10ms
 Verify with `php -v` that the outer process is indeed NTS; the
 embedded SAPI reports `PHP_ZTS=1` and `PHP_SAPI=ffi-zts`.
 
-## Build steps
+### Building the binaries from source
 
 ```sh
 # 1. ZTS PHP (embed SAPI) into /home/user/php-zts
