@@ -8,7 +8,7 @@
         {"name": "sj-i"}
     ],
     "require": {
-        "php": ">=8.4,<8.5",
+        "php": ">=8.5,<8.6",
         "composer-plugin-api": "^2.0",
         "ext-ffi": "*"
     },
@@ -32,7 +32,7 @@
     "extra": {
         "class": "SjI\\FfiZts\\ComposerPlugin",
         "ffi-zts": {
-            "php-abi": "8.4",
+            "php-abi": "8.5",
             "release-asset-format": "libphp-{phpabi}-{arch}-{libc}.tar.gz"
         }
     },
