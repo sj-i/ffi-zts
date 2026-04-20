@@ -1,17 +1,19 @@
 {
     "name": "sj-i/ffi-zts",
     "description": "Embed a ZTS PHP interpreter inside an NTS PHP process via FFI and run ZTS-only extensions (e.g. pecl/parallel) from a plain NTS CLI.",
-    "type": "library",
+    "type": "composer-plugin",
     "license": "MIT",
-    "keywords": ["ffi", "zts", "parallel", "embed", "threads"],
+    "keywords": ["ffi", "zts", "parallel", "embed", "threads", "composer-plugin"],
     "authors": [
         {"name": "sj-i"}
     ],
     "require": {
         "php": ">=8.4,<8.5",
+        "composer-plugin-api": "^2.0",
         "ext-ffi": "*"
     },
     "require-dev": {
+        "composer/composer": "^2.0",
         "phpunit/phpunit": "^11.0"
     },
     "autoload": {
@@ -27,17 +29,18 @@
     "bin": [
         "bin/ffi-zts"
     ],
-    "scripts": {
-        "post-install-cmd": "SjI\\FfiZts\\Installer::fetchBinaries",
-        "post-update-cmd":  "SjI\\FfiZts\\Installer::fetchBinaries"
-    },
     "extra": {
+        "class": "SjI\\FfiZts\\ComposerPlugin",
         "ffi-zts": {
             "php-abi": "8.4",
             "release-asset-format": "libphp-{phpabi}-{arch}-{libc}.tar.gz"
         }
     },
     "config": {
-        "sort-packages": true
+        "sort-packages": true,
+        "allow-plugins": {
+            "sj-i/ffi-zts": true,
+            "sj-i/ffi-zts-parallel": true
+        }
     }
 }
