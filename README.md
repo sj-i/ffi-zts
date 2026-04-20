@@ -24,6 +24,12 @@ composer require sj-i/ffi-zts
 downloads the pre-built `libphp.so` matching your host's PHP
 minor / CPU arch / libc into `vendor/sj-i/ffi-zts/bin/libphp.so`.
 
+Major tracks the host PHP minor: **1.x = PHP 8.4**, **2.x = PHP 8.5**.
+Composer resolves the right major automatically from your host's
+`php -v`; the 2.x line picks up upstream's static opcache, which
+makes `opcache.preload` under the embed work out of the box (see
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for measured numbers).
+
 ### Trusting the plugin
 
 Composer 2.2+ asks you to trust a new plugin before running it.
