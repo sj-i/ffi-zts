@@ -92,10 +92,92 @@ Our `Payload` occupies the same niche. Phase 4 / 5's richer
 shapes (frozen arrays, immutable object graphs) extend this niche
 where Python's sub-interpreter model has not yet taken it.
 
-## 4. Go
+## 4. Ruby Ractor
 
-Go sits in a different quadrant than PHP, Node, or Python. Three
-characteristics matter for our framing:
+Ruby's `Ractor` (experimental since Ruby 3.0, 2020; still flagged
+experimental through the 3.x line) is, of the runtimes surveyed
+here, the one whose design goals line up most closely with ours.
+
+| Ractor primitive | Role | PHP analogue |
+| --- | --- | --- |
+| `Ractor.new { ... }` | OS-threaded parallel execution unit with its own object space and globals | `parallel\Runtime` (+ `ffi-zts` for the NTS host) |
+| `Ractor#send(obj)` / `Ractor.receive` | Push channel | `Channel::send` / `Channel::recvInto` |
+| `Ractor#take` / `Ractor.yield` | Pull channel | (not yet; pull semantics deferred) |
+| `Ractor.select(*ractors)` | Multi-source wait | Event-loop-level `select` via `AsyncChannel` fds |
+| Shareable objects (deep-frozen + transitively shareable) | What can cross a Ractor boundary without copy | Phase 5: `@psalm-immutable` DTO + persistent HashTable |
+| `Ractor.make_shareable(obj)` | Recursive deep-freeze + shareability check | Phase 5 codec's hydration step (reflection + recursive immutability check) |
+| `send(obj, move: true)` | Move semantics -- original becomes "moved", access raises | **Our `Payload<Fresh>` -> `Payload<Drained>`** |
+| Shareable constants / frozen-string literals | Language-level discipline to keep cross-Ractor state sane | PHPStan rule banning aliasing of `Payload` |
+
+### 4.1 Where Ractor is stronger than what PHP can offer
+
+- **Language-level enforcement of shareability.** When you try to
+  `send` a non-shareable object without `move: true`, Ruby raises
+  at the channel boundary. Our equivalent is CI-time static
+  analysis; Ractor's is runtime VM enforcement. Ractor catches
+  reflection-style escape hatches that our PHPStan rule cannot.
+- **`make_shareable` is a one-liner.** Ruby's recursive freeze +
+  shareability check rolls up in a single call. Our Phase 5
+  codec does the same work conceptually, but the user API is
+  more verbose because we are doing it in application code, not
+  in the VM.
+- **Move semantics are observable post-move.** Accessing a
+  moved object raises `Ractor::MovedError`. We do not set a
+  runtime "drained" flag by default -- we rely on static
+  retyping. The runtime `ConsumedPayloadException` is a similar
+  guard for the cases static analysis misses.
+
+### 4.2 Where we have options Ractor does not
+
+- **Zero-copy for large byte buffers.** Ractor's `send` always
+  copies (unless `move: true`, which still walks the object
+  graph to validate shareability). Our Phase 1 handoff sends a
+  single pointer. The field reports from Ractor users have
+  repeatedly called this out as a reason real-world adoption has
+  been slow; our design is informed by that experience.
+- **Static-type discipline in the source language.** Ruby has
+  Sorbet / RBS but they are less pervasive than PHPStan / Psalm
+  in the PHP ecosystem. We can rely on static analysis being
+  present in users' CI.
+- **Object-graph sharing without copy.** Ractor's shareable-
+  object model requires a deep-frozen structure, and while it
+  is not copied on send, constructing it costs a full
+  recursive walk. Our Phase 5 approach builds the persistent
+  HashTable once at codec time and shares pointers thereafter.
+
+### 4.3 What we deliberately borrow
+
+- **Deep-frozen transitive immutability as the sharing
+  precondition.** Ruby's "shareable object" is a well-designed
+  contract -- an object is shareable iff it is frozen and every
+  object it transitively references is shareable. `@psalm-immutable`
+  gives us the static analogue: an object is shareable iff it is
+  immutable and every object it transitively references is
+  immutable. Same semantics, different enforcement venue.
+- **Explicit `move: true` as the default mental model.** Rather
+  than defaulting to copy (Ractor's default) or to shared-mutable
+  (Go's default), our default is handoff. This is closer to
+  Ractor's explicit-move philosophy than to Node's or Python's.
+- **The `make_shareable` spirit as an API affordance.** Phase 5's
+  `Arena::shareCollection($rows, Row::class)` should feel like
+  `Ractor.make_shareable` to users coming from Ruby: one call
+  takes ordinary application objects and hands back something
+  ready to cross the boundary.
+
+### 4.4 A separate observation on Ruby 3.3+ M:N threading
+
+Unrelated to Ractor but worth noting: Ruby 3.3 added an optional
+M:N mapping of Ruby Threads to native threads (the "MaNy"
+feature). This is for the ordinary `Thread` API, not `Ractor`,
+and it solves a different problem -- scheduler flexibility for
+existing single-Ractor code. We are not close to anything
+analogous, and the path to something like it in PHP (see
+`limits.md` §3.1) is squarely a VM-level concern.
+
+## 5. Go
+
+Go sits in a different quadrant than PHP, Node, Python, or Ruby.
+Three characteristics matter for our framing:
 
 1. **M:N scheduler (GPM).** Goroutines are multiplexed onto OS
    threads by the runtime; the scheduler owns both the task list
@@ -126,7 +208,7 @@ Go's `select` vocabulary (random fair choice, `default` for
 non-blocking, timer cases) is worth borrowing in the Phase 3
 structured combinators.
 
-## 5. Rust
+## 6. Rust
 
 Rust's `Send` / `Sync` marker traits are the gold standard for
 compile-time concurrency safety:
@@ -149,7 +231,7 @@ approach integrates into existing PHP CI pipelines; it does not
 require users to adopt a new language. Acknowledging that trade
 is part of the design, not a bug in it.
 
-## 6. Erlang / Elixir
+## 7. Erlang / Elixir
 
 Erlang is the philosophical antipode of shared-memory Go:
 
@@ -158,14 +240,13 @@ Erlang is the philosophical antipode of shared-memory Go:
   reference-counted (large binaries).
 - Per-process GC; actor death is recoverable.
 
-Our model is closer to Erlang than to Go in *policy* (ownership
-transfer, immutable sharing) but closer to Go in *mechanism*
-(shared process address space, OS-thread granularity). The design
-explicitly borrows from Erlang: the ownership-transfer default,
-the later-phase immutable-object sharing, and the "let it crash
-at the task boundary" posture for worker errors.
+Ruby's Ractor takes its explicit-isolation philosophy directly
+from Erlang. Our model is closer to Erlang and Ractor than to Go
+in *policy* (ownership transfer, immutable sharing) but closer to
+Go in *mechanism* (shared process address space, OS-thread
+granularity, not millions of µs-scale actors).
 
-## 7. What our niche actually is
+## 8. What our niche actually is
 
 In the space defined by:
 
@@ -175,11 +256,17 @@ In the space defined by:
 - **Static-type discipline** -- enforced ownership patterns in
   the types users already write.
 - **CPU parallelism** -- real OS threads, not coroutines.
+- **Zero-copy for large payloads** -- pointer handoff, not
+  even a shareability walk.
 
 ...this project is, as far as we know, the only current option
-for PHP. Node has the isolation and (narrower) sharing but lacks
-object graphs; Python has the isolation and is evolving its
-sharing whitelist; Go and Rust have richer sharing but at the
-cost of shared mutable state; Erlang has the isolation but
-rejects rich sharing on principle. PHP, through `ffi-zts` and
-this concurrency layer, can occupy a distinct quadrant.
+for PHP, and occupies a distinct point against other runtimes:
+Node has the isolation and (narrower) sharing but lacks object
+graphs; Python has the isolation and is evolving its sharing
+whitelist; Ruby Ractor has the isolation and an excellent
+shareability model but copies or walks on every send; Go and
+Rust have richer sharing but at the cost of shared mutable
+state; Erlang has the isolation but rejects rich sharing on
+principle. PHP, through `ffi-zts` and this concurrency layer,
+can occupy the "Ractor philosophy with pointer-level handoff"
+quadrant.
