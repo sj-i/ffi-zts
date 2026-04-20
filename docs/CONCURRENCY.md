@@ -105,7 +105,9 @@ could not anticipate.
 
 ## 4. Design documents
 
-Companion documents, added incrementally:
+Companion documents on this branch:
+
+**Phase 1 design-frozen set**
 
 - `docs/concurrency/payload.md` -- the persistent zend_string
   mechanism, CV injection implementation, ownership rules,
@@ -123,17 +125,23 @@ Companion documents, added incrementally:
   cannot do without VM support, and what the shape of future VM
   work would have to look like.
 
-Still to add (companion PRs):
+**Operational contracts (Phase 2+ but documented now so the
+design thinking is captured)**
 
-- `ERROR_MODEL.md` -- timeout / cancellation / worker-crash
-  semantics, retry-possible vs retry-impossible distinction.
-- `BACKPRESSURE.md` -- channel-full / pool-full policies
-  (block / drop / error) and when each is appropriate.
-- `UNSAFE_CHECKLIST.md` -- boundary conditions implementers must
-  respect (persistent-alloc timing, arena release ordering, CV
-  lifetime, cross-thread refcount).
-- `OBSERVABILITY.md` -- minimum metrics (arena total, in-flight
-  payload count, queue depth, per-worker timing).
+- `docs/concurrency/error-model.md` -- task-lifecycle exception
+  taxonomy, cancellation semantics, worker-crash handling,
+  combinator propagation rules, retry classification.
+- `docs/concurrency/backpressure.md` -- channel / pool full
+  policies (block / tryError / timeout / drop) with explicit
+  API verbs per policy, defaults, anti-patterns.
+- `docs/concurrency/unsafe-checklist.md` -- contributor-facing
+  boundary conditions (allocation discipline, CV injection
+  constraints, arena lifecycle, FFI CData lifetimes, shutdown
+  ordering) plus a PR-review checklist.
+- `docs/concurrency/observability.md` -- minimum metrics surface
+  (arena / channel / pool / payload), pull and push access,
+  exporter hooks for OpenTelemetry / Prometheus / StatsD,
+  overhead discipline.
 
 ## 5. Relationship to existing ffi-zts design
 
@@ -153,10 +161,8 @@ surface that sits on top of that raw pointer model:
 
 - Phase 1 scoping: **in progress** on branch
   `claude/php-ffi-zend-string-e6Hga`.
-- Companion detail documents: Phase 1 set complete
-  (`payload`, `safety`, `api`, `ecosystem`, `limits`). Error
-  model / backpressure / unsafe checklist / observability
-  companions are tracked in \u00a74 as follow-up.
+- Companion detail documents: full set on this branch (Phase 1
+  design-frozen + Phase 2+ operational contracts listed in \u00a74).
 - Implementation: not started. The current PR is design-only so
   that the Phase 1 surface is reviewable before code commits
   against it. An implementation PoC branch will follow, initially
