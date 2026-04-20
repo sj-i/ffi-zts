@@ -1,9 +1,10 @@
 # ffi-zts benchmarks
 
 Hand-runnable microbenchmarks for the numbers quoted in
-[`docs/DESIGN.md`](../../docs/DESIGN.md) §7.3. Point of reference
-rather than a CI-gated perf suite - they read env vars for their
-knobs so you can cheaply sweep N / ITER / SIZE.
+[`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md) (which is a
+companion to [`docs/DESIGN.md`](../../docs/DESIGN.md) §7). Point of
+reference rather than a CI-gated perf suite - they read env vars
+for their knobs so you can cheaply sweep N / ITER / SIZE.
 
 All scripts assume a host PHP 8.5+ NTS with `ext-ffi`, `ext-pcntl`,
 `ext-sockets`, and a working `composer require sj-i/ffi-zts-parallel`
