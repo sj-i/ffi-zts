@@ -85,16 +85,47 @@ Single-consumer paths continue to use the non-atomic fast path.
 
 ## 4. CV injection as the receive mechanism
 
-The consumer-side receive step needs to hand the consumer a PHP
-variable whose zval says "string, pointing at the shared
-zend_string". Userland PHP has no way to obtain the address of a
-function-local (compiled) variable to overwrite its zval, which is
-why naive approaches route through `$GLOBALS` or a holder object.
+### 4.1 Applicability and failure mode
 
-The primitive we actually want is available from C, through FFI,
-without polluting globals. `EG(current_execute_data)` points to the
-stack frame of the FFI method itself; its `->prev_execute_data`
-is the PHP caller's frame, which owns the CVs we want to write to:
+**CV injection works only when the receiving PHP frame is the
+direct synchronous caller of the injection helper.** The
+implementation walks `EG(current_execute_data)->prev_execute_data`
+to reach the op_array that owns the target CV. Any call path that
+interposes an additional frame -- a deferred callback fired from
+an event loop, an internal function that itself calls back into
+PHP, a destructor triggered during GC, a signal-dispatched
+handler -- lands in the wrong frame, and the CV lookup fails with
+`CvNotFoundException`.
+
+Concretely, CV injection is the fast path for:
+
+- `Channel::recvInto($name)` when called directly from user code
+  that declared `$name` as a local variable
+- `Host::runScript(..., bindings: [...])` injecting into the
+  script's top-level CVs at execution entry
+- closures invoked synchronously from user code that uses
+  `recvInto`
+
+It does **not** work for:
+
+- `AsyncChannel::recvInto` dispatched from a Revolt / AMP event
+  loop tick
+- any handler installed via `register_shutdown_function`,
+  `spl_object_*`, or similar post-scope hooks
+- reentry from PHP code called through internal functions that
+  take callables
+
+For those paths, use one of the alternative Injectors (static
+property, holder object, `$GLOBALS`) described in the API doc.
+The Phase 1 design treats CV injection as a specialised fast
+path, not a universal receive mechanism.
+
+### 4.2 Implementation
+
+The primitive we want is available from C, through FFI, without
+polluting globals. `EG(current_execute_data)` points to the stack
+frame of the FFI method itself; its `->prev_execute_data` is the
+PHP caller's frame, which owns the CVs we want to write to:
 
 ```c
 void ffi_inject_cv(const char *name, size_t nlen, zend_string *s) {
@@ -110,10 +141,11 @@ void ffi_inject_cv(const char *name, size_t nlen, zend_string *s) {
             return;
         }
     }
+    /* name not found: caller raises CvNotFoundException */
 }
 ```
 
-From PHP:
+From PHP, used correctly:
 
 ```php
 function consume(Channel $ch): void {
@@ -123,7 +155,7 @@ function consume(Channel $ch): void {
 }                                 // CV dtor -> pefree on scope exit
 ```
 
-### 4.1 Properties
+### 4.3 Properties
 
 - **No global state.** `$GLOBALS` / symbol_table not touched.
 - **Scope-local lifetime.** The CV dtor fires at function return,
@@ -132,28 +164,25 @@ function consume(Channel $ch): void {
 - **Cheap lookup.** `op_array->last_var` is the number of CVs in
   the caller's function, typically small. Linear search over
   interned name strings.
-- **Works inside closures.** The op_array of a closure has its own
-  CV table; `prev_execute_data` still points there.
-- **Does not work from async tails.** If the C helper is called
-  from a context where the direct PHP caller is not the function
-  whose CV we want to write (e.g. a deferred callback invoked from
-  a reactor), the `prev_execute_data` chain points elsewhere. For
-  those cases we fall back to holder-object or static-property
-  injection, documented separately.
+- **Works for direct closure calls.** The op_array of a closure
+  has its own CV table; `prev_execute_data` points to it when the
+  closure is invoked synchronously. Deferred closure invocations
+  fall under the failure cases in \u00a74.1.
 
-### 4.2 Alternatives considered
+### 4.4 Alternatives considered
 
 | Target | Status | Why not default |
 | --- | --- | --- |
-| `EG(symbol_table)` (`$GLOBALS['x']`) | fallback | Pollutes global namespace; user must know the key. |
-| Static property on a holder class | fallback | Usable from any scope but requires a dedicated class and slot discipline. |
-| Object property table | fallback | Requires caller to keep a holder instance alive and pass its handle. |
+| Static property on a holder class | **fallback** for deferred / async receive | Usable from any scope but requires a dedicated class and slot discipline. |
+| Object property table | **fallback** | Requires caller to keep a holder instance alive and pass its handle. |
+| `EG(symbol_table)` (`$GLOBALS['x']`) | **fallback** | Pollutes global namespace; user must know the key. |
 | Function return value slot | rejected | FFI's return-type conversion overwrites whatever the C helper stages. |
 | Construct a PHP zval in FFI CData | rejected | CData is not a PHP variable; the VM does not see it as one. |
 
-The fallback targets will be exposed as alternative `Injector`
-implementations for the deferred / async cases. The CV route is the
-fast path for synchronous receive.
+The three fallbacks are first-class alternative `Injector`
+implementations, not second-class citizens. They are chosen
+per-transport: synchronous receive uses CV; deferred / async
+receive uses one of the others.
 
 ## 5. Pre-allocated buffer pattern
 
@@ -224,8 +253,13 @@ Arena lifetime is the user's choice:
   `send()` / `recvInto()` integration points.
 - `CvInjector` implemented in C, loaded via FFI cdef from
   libphp.so symbols.
+- `StaticPropertyInjector` and `GlobalInjector` as alternative
+  implementations for non-synchronous receive paths.
 - A single in-process round-trip test: NTS host allocates, embedded
   ZTS reads back, byte hash matches.
+- A failure test: CV injection from a deferred callback raises
+  `CvNotFoundException` rather than silently writing to the wrong
+  frame.
 
 Cross-thread channel plumbing, atomic refcount, broadcast, async
 fd-backed channels, and structured concurrency all build on this
