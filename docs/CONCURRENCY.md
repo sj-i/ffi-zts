@@ -2,8 +2,15 @@
 
 Status: **Draft** -- outline of the zero-copy data-sharing and
 higher-level concurrency layer to be built on top of the ffi-zts
-embed. Companion detail documents will follow; this page is the
-entry point.
+embed. Companion detail documents follow; this page is the entry
+point.
+
+> **Reading guide.** Phase 1 (\u00a73 below and the
+> `payload.md` / `safety.md` / `api.md` \u00a72 sections of the
+> companions) is the only part we treat as design-frozen. Phases
+> 2-6 are sketches to show that the Phase 1 surface composes
+> additively; their shapes are expected to move as Phase 1 is
+> implemented and measured.
 
 ## 1. Summary
 
@@ -21,18 +28,22 @@ This design adds that layer in stages:
    consumer side as a plain PHP `string` with no copy.
 2. **Move-semantic handle types** -- a `Payload<Fresh | Drained>`
    state machine enforced statically via PHPStan / Psalm
-   `@param-out`, with runtime fallbacks for the aliasing cases
-   static analysis cannot see.
+   `@param-out`, with a runtime double-consume guard for the cases
+   static analysis cannot see. We do not claim runtime aliasing
+   detection -- see `safety.md` \u00a72.3 for why.
 3. **Richer payload shapes** -- later phases extend the same
    mechanism to immutable arrays and immutable object graphs,
    targeting read-heavy use cases (ORM row fan-out, DTO broadcast,
-   configuration sharing).
+   configuration sharing). These phases are structurally harder
+   than Phase 1 (`limits.md` \u00a72.5) and are scheduled only after
+   Phase 1 validates the approach.
 4. **Async channels** -- an `fd`-backed channel primitive so that
    channel waits and I/O waits can coexist in a single event loop
    inside a worker.
 5. **Structured concurrency** -- thread pools, `Task` primitives,
    and combinators (`all` / `race` / `forEach`) layered on the
-   above.
+   above, with cancellation semantics that are honestly cooperative
+   (not preemptive; see `limits.md` \u00a72.1).
 
 The satellite package `sj-i/ffi-zts-parallel` hosts the cross-thread
 pieces (channels, pool, structured concurrency). The core package
@@ -70,39 +81,59 @@ embedded-ZTS scenarios (Arena, Payload, CV injection).
 - Not a goroutine-level M:N scheduler. True M:N requires VM-level
   fiber unmount / remount support that does not exist in current
   PHP. We document the gap and stop there.
+- Not a universal receive mechanism via CV injection. CV injection
+  is a fast path for synchronous receive; deferred / async /
+  signal-dispatched paths use alternative Injectors. See
+  `api.md` \u00a72.5 and `payload.md` \u00a74.1.
 
 ## 3. Phases at a glance
 
-| Phase | Deliverable | Repo |
-| --- | --- | --- |
-| 1 | Arena + `Payload<Fresh|Drained>` + CV injection + PHPStan rule + in-process NTS <-> ZTS round-trip test | `ffi-zts` |
-| 2 | `fd`-backed `AsyncChannel` + atomic primitives + thread pool + `parallel\Channel` adapter | `ffi-zts-parallel` |
-| 3 | Structured concurrency combinators (`all`, `race`, `forEach`); work-stealing-aware API surface | `ffi-zts-parallel` |
-| 4 | Immutable array payloads (persistent `HashTable` + `IS_ARRAY_IMMUTABLE`) | `ffi-zts` |
-| 5 | Immutable object-graph codec (`@psalm-immutable` DTO -> shared persistent HashTable + per-VM thin wrapper) | `ffi-zts` |
-| 6+ | Shared mmap buffer + atomic counter primitives; mutex / rwlock; MPMC queue | `ffi-zts-parallel` |
+| Phase | Deliverable | Repo | Status |
+| --- | --- | --- | --- |
+| 1 | Arena + `Payload<Fresh|Drained>` + CV injection + alternative Injectors + PHPStan rule + in-process NTS <-> ZTS round-trip test | `ffi-zts` | **scoped** |
+| 2 | `fd`-backed `AsyncChannel` + atomic primitives + thread pool + `parallel\Channel` adapter | `ffi-zts-parallel` | *sketch* |
+| 3 | Structured concurrency combinators (`all`, `race`, `forEach`); cancellation scope; work-stealing-aware API | `ffi-zts-parallel` | *sketch* |
+| 4 | Immutable array payloads (persistent `HashTable` + `IS_ARRAY_IMMUTABLE`) | `ffi-zts` | *sketch* |
+| 5 | Immutable object-graph codec (`@psalm-immutable` DTO -> shared persistent HashTable + per-VM thin wrapper) | `ffi-zts` | *sketch* |
+| 6+ | Shared mmap buffer + atomic counter primitives; mutex / rwlock; MPMC queue | `ffi-zts-parallel` | *sketch* |
 
 Phase 1 is the **valve**: if it does not deliver, nothing else
 matters. Subsequent phases are scheduled opportunistically based
-on what real workloads ask for.
+on what real workloads ask for, and their design is expected to
+shift as Phase 1 implementation uncovers details the document
+could not anticipate.
 
 ## 4. Design documents
 
 Companion documents, added incrementally:
 
 - `docs/concurrency/payload.md` -- the persistent zend_string
-  mechanism, CV injection implementation, ownership rules.
+  mechanism, CV injection implementation, ownership rules,
+  and the applicability constraints of CV injection.
 - `docs/concurrency/safety.md` -- the static + runtime safety
-  model, PHPStan rule set, aliasing mitigations.
+  model, PHPStan rule set, acknowledged gaps (notably: no runtime
+  aliasing detection in Phase 1).
 - `docs/concurrency/api.md` -- public API surface, naming
-  conventions, namespace discipline.
+  conventions, namespace discipline, and Phase 2+ sketches.
 - `docs/concurrency/ecosystem.md` -- comparison with Node Worker
-  Threads, Python sub-interpreters, Go, Rust, Erlang; notes on
-  PHP RFC activity adjacent to this work (we track but do not
-  depend on any specific RFC).
+  Threads, Python sub-interpreters, Ruby Ractor, Go, Rust, and
+  Erlang; notes on PHP RFC activity adjacent to this work (we
+  track but do not depend on any specific RFC).
 - `docs/concurrency/limits.md` -- what userspace fundamentally
   cannot do without VM support, and what the shape of future VM
   work would have to look like.
+
+Still to add (companion PRs):
+
+- `ERROR_MODEL.md` -- timeout / cancellation / worker-crash
+  semantics, retry-possible vs retry-impossible distinction.
+- `BACKPRESSURE.md` -- channel-full / pool-full policies
+  (block / drop / error) and when each is appropriate.
+- `UNSAFE_CHECKLIST.md` -- boundary conditions implementers must
+  respect (persistent-alloc timing, arena release ordering, CV
+  lifetime, cross-thread refcount).
+- `OBSERVABILITY.md` -- minimum metrics (arena total, in-flight
+  payload count, queue depth, per-worker timing).
 
 ## 5. Relationship to existing ffi-zts design
 
@@ -122,8 +153,13 @@ surface that sits on top of that raw pointer model:
 
 - Phase 1 scoping: **in progress** on branch
   `claude/php-ffi-zend-string-e6Hga`.
-- Companion detail documents: to be added incrementally on the
-  same branch before any implementation lands, so the API shape
-  is reviewable before code commits against it.
-- Implementation: not started. The intent is to lock the Phase 1
-  surface in writing first, then build outwards.
+- Companion detail documents: Phase 1 set complete
+  (`payload`, `safety`, `api`, `ecosystem`, `limits`). Error
+  model / backpressure / unsafe checklist / observability
+  companions are tracked in \u00a74 as follow-up.
+- Implementation: not started. The current PR is design-only so
+  that the Phase 1 surface is reviewable before code commits
+  against it. An implementation PoC branch will follow, initially
+  covering Arena + Payload + CvInjector + round-trip test; that
+  PoC is expected to surface details that will in turn revise
+  these documents.
