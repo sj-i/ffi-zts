@@ -11,11 +11,11 @@ on:
   workflow_dispatch:
     inputs:
       php-version:
-        description: 'PHP source version to build (e.g. 8.4.19)'
-        default: '8.4.19'
+        description: 'PHP source version to build (e.g. 8.5.5)'
+        default: '8.5.5'
         required: true
       release-tag:
-        description: 'Release tag to attach the artefact to (e.g. libphp-8.4)'
+        description: 'Release tag to attach the artefact to (e.g. libphp-8.5)'
         default: ''
         required: false
   push:
@@ -32,7 +32,7 @@ jobs:
     permissions:
       contents: write
     env:
-      PHP_VERSION: ${{ github.event.inputs.php-version || '8.4.19' }}
+      PHP_VERSION: ${{ github.event.inputs.php-version || '8.5.5' }}
       PREFIX: ${{ github.workspace }}/php-zts
       BUILD_DIR: ${{ github.workspace }}/build
     steps:
