@@ -28,23 +28,23 @@ loud secondary line.
 ### 2.1 Layer 1 -- static type state (PHPStan / Psalm)
 
 A `Payload` carries a phantom type parameter for its lifecycle
-state:
+state. The parameter is **invariant**: `Payload<Fresh>` and
+`Payload<Drained>` are distinct types and neither is assignable
+to the other.
 
 ```php
 /**
- * @template-covariant TState of Fresh|Drained
+ * @template TState of Fresh|Drained
  */
 final class Payload
 {
     /**
-     * @param-out Payload<Drained> $this
-     */
-    public function send(Channel $ch): void { ... }
-
-    /**
-     * Only callable while fresh.
+     * Drains the payload and returns the raw pointer. Intended
+     * for Channel implementations, not user code. @phpstan-self-out
+     * retypes $this to Payload<Drained> so further methods fail the
+     * type check.
      *
-     * @phpstan-this-out self<Drained>
+     * @phpstan-self-out self<Drained>
      */
     public function take(): int { ... }
 }
@@ -53,13 +53,22 @@ final class Payload
 public function alloc(int $size): Payload { ... }
 ```
 
-`Channel::send(Payload $p)` accepts only `Payload<Fresh>` and
-rewrites the caller's variable to `Payload<Drained>` via
-`@param-out`. After `send()`, attempting to call any write / read
-method on the variable fails under PHPStan (the methods do not
-exist on `Payload<Drained>`).
+The handoff boundary is where `<Fresh>` is statically required.
+For example `Channel::send` is declared:
 
-Users get a red squiggle in their IDE before the code ever runs.
+```php
+/**
+ * @param        Payload<Fresh>   $payload
+ * @param-out    Payload<Drained> $payload
+ */
+public function send(Payload $payload): void;
+```
+
+Passing a `Payload<Drained>` to `send()` fails PHPStan. After
+the call, the caller's variable is retyped to `Payload<Drained>`,
+so any subsequent read / write method on it also fails the type
+check. Users get a red squiggle in their IDE before the code
+ever runs.
 
 ### 2.2 Layer 2 -- custom PHPStan rule against aliasing
 
@@ -85,29 +94,26 @@ A custom PHPStan rule flags these patterns on `Payload` values:
 | `static::$field = $p;` | **error** |
 | `fn () use ($p) => ...` | **error** |
 | `fn () use (&$p) => ...` | **error** |
-| `Reflection...->setValue($p)` | not analysed; relies on layer 3 |
+| `Reflection...->setValue($p)` | not analysed; see \u00a76 |
 
 The rule ships in this repository and is wired up via
 `phpstan-extension.neon`, so Composer autoloading picks it up when
 a user requires `sj-i/ffi-zts`.
 
-### 2.3 Layer 3 -- runtime aliasing detection
+### 2.3 Layer 3 -- runtime consumed-state check
 
-Static rules cannot see reflection, variable-variables, string
-`eval`, or third-party extensions that clone zvals. For those, the
-final guard is a runtime refcount check at handoff:
+Ideally Layer 3 would read the Payload's zval refcount at handoff
+to catch lingering aliases that slipped past static analysis. PHP's
+userland does not expose that: there is no standard
+`debug_zval_refcount()` function, and `debug_zval_dump()` only
+writes to stdout. We therefore **do not attempt runtime aliasing
+detection** in Phase 1.
+
+What Layer 3 does guarantee is the **double-consume** case:
 
 ```php
 public function take(): int
 {
-    // +1 for the argument binding into debug_zval_refcount itself.
-    if (\debug_zval_refcount($this) > 2) {
-        throw new AliasedPayloadException(
-            'Payload has additional references and cannot '
-            . 'transfer ownership. Hold it only in a local '
-            . 'variable between alloc and send.'
-        );
-    }
     if ($this->ptr === null) {
         throw new ConsumedPayloadException(
             'Payload was already sent or released.'
@@ -119,8 +125,24 @@ public function take(): int
 }
 ```
 
-The check is O(1), executes at send-time only, and fails loudly
-with a message that points the user toward the supported pattern.
+The first `send()` (or any consume path) nulls the internal
+pointer; a second consume on any aliased reference raises
+cleanly instead of double-freeing the persistent zend_string.
+
+This means plain aliasing that never triggers a second consume
+goes undetected at runtime. The enforcement story is therefore:
+
+- Layer 1 types catch use-after-send on the original variable.
+- Layer 2's PHPStan rule catches common aliasing patterns.
+- Layer 3 catches double-consume even through aliased references.
+- The gap between them (an alias that slips past Layer 2 and is
+  never consumed a second time, so Layer 3 does not fire) is
+  acknowledged in \u00a76 as out of scope for Phase 1.
+
+A future phase may add refcount-based detection via an FFI helper
+that reads the zval header directly -- that moves the safety
+story from "static-first" to "static + FFI helper" and is
+deferred until measured need.
 
 ### 2.4 Layer 4 -- destructor cleanup for leaks
 
@@ -161,10 +183,9 @@ actionable messages:
 
 | Exception | Thrown when |
 | --- | --- |
-| `ConsumedPayloadException` | Operation attempted on a Payload whose `ptr` is null (already sent or released). |
-| `AliasedPayloadException` | Refcount > 2 at handoff. |
+| `ConsumedPayloadException` | Operation attempted on a Payload whose `ptr` is null (already sent or released; may be reached via an aliased reference that bypassed Layer 2). |
 | `ArenaClosedException` | Allocation requested from an arena that has been released. |
-| `CvNotFoundException` | `recvInto('name')` called where the named CV does not exist in the caller's op_array. |
+| `CvNotFoundException` | `recvInto('name')` called where the named CV does not exist in the caller's op_array, or CV injection invoked from a non-synchronous context whose `prev_execute_data` chain points elsewhere. |
 
 These extend `LogicException` rather than `RuntimeException`
 because all of them indicate programmer error rather than
@@ -181,17 +202,21 @@ Each enforcement layer has a dedicated test fixture:
   firing) are caught the same way as new violations.
 - **Runtime** -- `tests/runtime/` exercises the reflection /
   variable-variable escape hatches explicitly and asserts the
-  correct exception type.
+  correct exception type where we do detect, and documents (as
+  expected behaviour) the cases we do not detect.
 - **Destructor cleanup** -- `tests/arena/` allocates without
   sending and verifies (via `/proc/self/statm` or equivalent)
   that memory is released on scope exit.
 
 ## 6. What the safety model does not catch
 
-- **Reflection-driven refcount manipulation.** A sufficiently
-  determined caller can bump a Payload's refcount via low-level
-  reflection or by passing through obscure extensions. The
-  runtime check catches common cases but is not a sandbox.
+- **Reflection-driven aliasing.** PHP userland does not expose
+  zval refcount, so aliasing through reflection,
+  variable-variables, or third-party extensions that clone zvals
+  goes undetected at runtime (see \u00a72.3). Layer 2's PHPStan rule
+  catches the common syntactic aliasing patterns; beyond that,
+  the threat model assumes trusted application code. A runtime
+  detector via FFI helper is possible but deferred.
 - **FFI-level pointer theft.** Anyone with FFI access can read
   the raw `ptr` field off a Payload via FFI reflection. There is
   no way to hide a pointer from FFI, and trying to would be
@@ -209,11 +234,12 @@ code.
 
 ## 7. Relationship to language-level concurrency safety
 
-Rust's `Send` / `Sync`, Swift's `Sendable`, and similar compiler-
-level guarantees are stronger than anything PHP's tooling can
-provide today. The difference is one of enforcement venue, not of
-intent: our rules do the same checking, just via the ecosystem's
-static analysers rather than the core compiler.
+Rust's `Send` / `Sync`, Swift's `Sendable`, Ruby Ractor's
+shareability check, and similar runtime- or compiler-level
+guarantees are stronger than anything PHP's tooling can provide
+today. The difference is one of enforcement venue, not of intent:
+our rules do the same checking, just via the ecosystem's static
+analysers rather than the core compiler or VM.
 
 This is a practical compromise, not an ideal. If PHP grows native
 support for equivalent contracts in the future, our user-visible
