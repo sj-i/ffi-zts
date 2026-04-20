@@ -1,8 +1,9 @@
 # Public API surface
 
 Status: **Draft** -- user-visible classes and methods for the
-concurrency layer. Phase 1 is in scope for detailed design; later
-phases are sketched to show that they slot in additively.
+concurrency layer. Section 2 (Phase 1) is in scope for detailed
+design. Sections 4 and 5 are roadmap sketches for later phases,
+subject to change.
 
 ## 1. Namespace discipline
 
@@ -65,23 +66,39 @@ interface Arena
 
 ### 2.3 Payload
 
+The phantom type parameter is **invariant**. `Payload<Fresh>` and
+`Payload<Drained>` are distinct types; neither is assignable to
+the other. State transitions happen at handoff points (notably
+`Channel::send`, `Host::runScript` with `bindings`, and
+`Payload::take` on internal channel implementations), where the
+caller's variable is explicitly retyped from `<Fresh>` to
+`<Drained>` via `@param-out` / `@phpstan-self-out`.
+
 ```php
 /**
- * @template-covariant TState of Fresh|Drained
+ * @template TState of Fresh|Drained
  */
 final class Payload
 {
     public function size(): int;
 
     /**
-     * @param-this-out Payload<Fresh>     // only callable on Fresh
+     * Write bytes into the payload buffer.
+     *
+     * Precondition: this must be a Payload<Fresh>. The static
+     * guarantee against writing to a drained payload is delivered
+     * at the handoff boundary (Channel::send, see below) by
+     * retyping the variable to Payload<Drained>, which lacks
+     * this method's signature at the static level. Direct calls
+     * on a drained payload still fail at runtime via the
+     * consumed-state check (see safety.md \u00a72.3).
      */
     public function writeFromString(int $offset, string $bytes): void;
 
     /**
      * Internal API -- drains the payload and returns the raw
-     * pointer. Intended for Channel implementations, not user
-     * code.
+     * pointer. Intended for Channel / bindings implementations,
+     * not user code.
      *
      * @phpstan-self-out self<Drained>
      */
@@ -93,8 +110,26 @@ final class Fresh {}
 final class Drained {}
 ```
 
-Users almost never reference `Fresh` or `Drained` directly -- they
-only appear in `Payload<...>` type annotations on parameters and
+The handoff boundary where the static precondition is enforced:
+
+```php
+interface Channel
+{
+    /**
+     * @param        Payload<Fresh>   $payload
+     * @param-out    Payload<Drained> $payload
+     */
+    public function send(Payload $payload): void;
+}
+```
+
+Passing a `Payload<Drained>` to `send()` is a PHPStan error.
+After the call, the caller's variable is retyped to
+`Payload<Drained>`, and any subsequent call on it that requires
+`Fresh` is also a PHPStan error.
+
+Users almost never reference `Fresh` or `Drained` directly --
+they only appear in `Payload<...>` annotations on parameters and
 returns.
 
 ### 2.4 Script execution with bindings
@@ -112,10 +147,22 @@ execution. The caller's `Payload<Fresh>` variables become
 `Payload<Drained>` on return -- handoff semantics identical to
 `Channel::send()`.
 
-### 2.5 CvInjector (advanced)
+### 2.5 CvInjector
 
-For users who want to drive CV injection from their own transport
-(e.g. a custom channel):
+**Applicability.** CV injection works when the receiving PHP
+frame is the direct synchronous caller of the injection helper.
+The implementation walks
+`EG(current_execute_data)->prev_execute_data` to reach the
+caller's op_array, so call paths that interpose an additional
+frame -- deferred callbacks fired from an event loop, internal
+functions that call back into PHP, destructors triggered during
+GC, signal handlers -- land in the wrong frame and fail with
+`CvNotFoundException`.
+
+For synchronous receive (the common case after `Channel::recv`
+where the caller is a user function), CV injection is the fast
+path. For asynchronous / deferred receive, the alternative
+Injectors below must be used.
 
 ```php
 interface CvInjector
@@ -125,16 +172,31 @@ interface CvInjector
      * caller's PHP frame. Transfers ownership: the Payload is
      * drained on success.
      *
-     * @phpstan-param-out Payload<Drained> $payload
+     * @param-out Payload<Drained> $payload
+     *
+     * @throws CvNotFoundException
+     *         The named CV does not exist in the caller's op_array,
+     *         or this method was invoked from a non-synchronous
+     *         context whose prev_execute_data chain does not point
+     *         at the intended receiving frame.
      */
     public function injectInto(string $cvName, Payload $payload): void;
 }
 ```
 
-The default implementation targets `prev_execute_data->func->op_array`
-(synchronous caller's CV). Alternative implementations for
-non-synchronous cases (static property, object property, global)
-are exposed as separate classes users can opt into.
+Alternative Injector implementations (not bound to the caller's
+frame):
+
+| Injector | Target | Use when |
+| --- | --- | --- |
+| `CvInjector` (default) | `prev_execute_data->func->op_array` CV | Synchronous receive, caller-frame write |
+| `StaticPropertyInjector` | `ClassName::$slot` | Deferred callback, event-loop tail, any cross-frame receive |
+| `HolderObjectInjector` | `$holder->property` | Same as above, when caller already has a holder object |
+| `GlobalInjector` | `$GLOBALS['key']` | Last resort; pollutes global namespace but always reachable |
+
+Choose the Injector per-transport. The default `Channel::recvInto`
+uses `CvInjector`; an `AsyncChannel` driven from an event loop
+would default to one of the non-CV Injectors.
 
 ## 3. Phase 1 escape hatches
 
@@ -169,12 +231,16 @@ echo $view[999]->value;
 Both bypasses live on top of the `Payload` / `string` duality and
 require no additions to the core API.
 
-## 4. Satellite package API (Phase 2+)
+## 4. Roadmap sketches -- satellite package API (Phase 2+)
 
-Sketched here to show fit; detailed design lives in
-`sj-i/ffi-zts-parallel`.
+> **These are sketches, not contracts.** Names, shapes, and method
+> sets here are expected to move as Phase 1 is implemented and
+> measured. The Phase 1 surface in \u00a72 is the only part of the
+> document readers should treat as design-frozen.
 
-### 4.1 Channel
+Detailed design will live in `sj-i/ffi-zts-parallel`.
+
+### 4.1 Channel (sketch)
 
 ```php
 use SjI\FfiZts\Parallel\Concurrent\Channel;
@@ -182,22 +248,25 @@ use SjI\FfiZts\Parallel\Concurrent\Channel;
 $ch = Channel::open('jobs');
 
 /**
+ * @param     Payload<Fresh>   $payload
  * @param-out Payload<Drained> $payload
  */
 $ch->send(Payload $payload): void;
 
 /**
  * Blocks until a message is available, then injects it as a
- * zend_string into the named CV in the caller's frame.
+ * zend_string into the named CV in the caller's frame. Uses
+ * CvInjector by default -- same synchronous-caller constraint
+ * applies (see \u00a72.5).
  */
 $ch->recvInto(string $cvName): void;
 ```
 
 `AsyncChannel` is the same interface with an added `fd(): int` so
-event loops can `poll` / `epoll` on it. Implementation detail is in
-`ecosystem.md` and a future `async-channel.md`.
+event loops can `poll` / `epoll` on it. Implementation detail is
+sketched in `ecosystem.md` and a future `async-channel.md`.
 
-### 4.2 Pool (Phase 2)
+### 4.2 Pool (sketch)
 
 ```php
 use SjI\FfiZts\Parallel\Concurrent\Pool;
@@ -210,7 +279,7 @@ $future = $pool->submit(
 $result = $future->get();
 ```
 
-### 4.3 Structured combinators (Phase 3)
+### 4.3 Structured combinators (sketch)
 
 ```php
 use SjI\FfiZts\Parallel\Concurrent\Structured;
@@ -228,7 +297,12 @@ $winner = Structured::race([
 Structured::forEach($items, fn ($item) => process($item), concurrency: 8);
 ```
 
-### 4.4 Atomics (Phase 2)
+Cancellation and cooperative-cancel behaviour on these
+combinators is covered in the limits doc (`limits.md` \u00a72.1) and
+needs its own `ERROR_MODEL.md` companion before the shapes above
+are committed.
+
+### 4.4 Atomics (sketch)
 
 ```php
 use SjI\FfiZts\Parallel\Concurrent\Atomic;
@@ -246,7 +320,12 @@ Naming follows the Node `Atomics` vocabulary (`add`, `sub`, `load`,
 `store`, `compareExchange`, `wait`, `notify`) so users moving
 between ecosystems carry the vocabulary.
 
-## 5. Type-progression API (Phases 4 / 5)
+## 5. Roadmap sketches -- type progression (Phases 4 / 5)
+
+> **Also sketches.** Phase 4 (immutable arrays) and especially
+> Phase 5 (immutable object graphs) are structurally harder than
+> Phase 1 -- see `limits.md` \u00a72.5. The shapes below show the
+> intended ergonomics, not a firm design.
 
 The phantom-type scheme extends naturally to richer payloads:
 
@@ -283,17 +362,20 @@ For Phase 1 workflows:
 | "I want to pass typed records." | `Payload::viewAs()` + struct definition |
 | "I want the worker to return a big result." | Same flow, reversed: worker allocates, sends, caller `recvInto`. |
 
-For Phase 2+, the same primitives apply, with the satellite's
-`Channel` / `Pool` / `Structured` APIs layered over them.
+The Phase 2+ shapes above use the same primitives layered up.
 
 ## 7. What users should avoid
 
 - Holding a `Payload` reference anywhere other than a local
   variable. The custom PHPStan rule enforces this.
 - Sending the same `Payload` twice. Static types catch the second
-  `send()` via `Payload<Drained>` lacking the method.
+  `send()` via `Payload<Drained>` lacking the required signature.
 - Calling `FFI::string($cdata, $len)` when a Payload flow would
   serve the same purpose. It silently copies.
 - Using `parallel\Channel::send($payload)` directly. The raw
   parallel channel will serialise. Always go through the satellite
   package's `Channel`, which understands Payload handoff.
+- Calling `recvInto` from a context that is not the direct
+  synchronous caller of the injection helper (see \u00a72.5 and
+  `CvNotFoundException`). For deferred / event-loop paths, use
+  `StaticPropertyInjector` or `HolderObjectInjector` instead.
