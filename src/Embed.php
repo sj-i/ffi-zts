@@ -46,6 +46,7 @@ final class Embed
     private CData $zendStreamInit;
     private CData $phpExecuteScript;
     private CData $zendDestroyFh;
+    private ?CData $zendSetDlUseDeepbind = null;
 
     private ?CData $module = null;
     /** @var list<CData> */
@@ -203,6 +204,17 @@ final class Embed
         return $ptr;
     }
 
+    private function symOptional(string $name, string $fnPtrType): ?CData
+    {
+        $addr = $this->libc->dlsym($this->libphp, $name);
+        if (FFI::isNull($addr)) {
+            return null;
+        }
+        $ptr = $this->ffi->new($fnPtrType);
+        FFI::memcpy(FFI::addr($ptr), FFI::addr($addr), FFI::sizeof($ptr));
+        return $ptr;
+    }
+
     private function bindSymbols(): void
     {
         $this->tsrmStartup           = $this->sym('php_tsrm_startup',            'void (*)(void)');
@@ -218,6 +230,17 @@ final class Embed
         $this->zendStreamInit        = $this->sym('zend_stream_init_filename',  'void (*)(struct zend_file_handle *, const char *)');
         $this->phpExecuteScript      = $this->sym('php_execute_script',         'uint8_t (*)(struct zend_file_handle *)');
         $this->zendDestroyFh         = $this->sym('zend_destroy_file_handle',   'void (*)(struct zend_file_handle *)');
+
+        // PHP 8.5 introduced `zend_dl_use_deepbind` (php/php-src#18612)
+        // which gates RTLD_DEEPBIND on extension dlopen behind this
+        // runtime flag. Default is `false`, so without opting in
+        // parallel.so's references to zend_register_internal_class_*
+        // etc. resolve through the host NTS binary (which re-exports
+        // the whole Zend API on 8.5 thanks to opcache going static)
+        // and the embed segfaults on first MINIT. On 8.4 the setter
+        // doesn't exist; stay silent there - 8.4 keeps the old
+        // unconditional-DEEPBIND behaviour without any opt-in.
+        $this->zendSetDlUseDeepbind  = $this->symOptional('zend_set_dl_use_deepbind', 'void (*)(uint8_t)');
     }
 
     private function buildModule(): void
@@ -233,6 +256,12 @@ final class Embed
         $startup = function ($module) {
             $ini = IniBuilder::build($this->config);
             $this->module->ini_entries = $this->cString($ini);
+            // PHP 8.5+: re-enable RTLD_DEEPBIND for extension dlopen.
+            // Must be flipped on BEFORE php_module_startup triggers
+            // zend_startup_modules / php_load_shlib.
+            if ($this->zendSetDlUseDeepbind !== null) {
+                ($this->zendSetDlUseDeepbind)(1);
+            }
             return ($this->phpModuleStartup)($module, null);
         };
         $ubWrite  = function (string $s, int $n) { echo $s; return $n; };
