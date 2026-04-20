@@ -1,0 +1,83 @@
+name: Build libphp.so
+
+# Builds the ZTS libphp.so artefact described in docs/DESIGN.md §6.3
+# and attaches it to a GitHub Release.
+#
+# Triggered manually (workflow_dispatch) or on a tag matching
+# libphp-*. Source compilation is slow (~10 min on a hosted
+# runner), so it deliberately does NOT run on every PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      php-version:
+        description: 'PHP source version to build (e.g. 8.4.19)'
+        default: '8.4.19'
+        required: true
+      release-tag:
+        description: 'Release tag to attach the artefact to (e.g. libphp-8.4)'
+        default: ''
+        required: false
+  push:
+    tags:
+      - 'libphp-*'
+
+concurrency:
+  group: build-libphp-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PHP_VERSION: ${{ github.event.inputs.php-version || '8.4.19' }}
+      PREFIX: ${{ github.workspace }}/php-zts
+      BUILD_DIR: ${{ github.workspace }}/build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential autoconf bison re2c pkg-config \
+              libxml2-dev libsqlite3-dev libreadline-dev libffi-dev \
+              libonig-dev
+
+      - name: Build ZTS PHP
+        run: bash scripts/build-zts-php.sh
+
+      - name: Pack libphp tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          libc=glibc
+          phpabi=$(echo "$PHP_VERSION" | cut -d. -f1,2)
+          asset="libphp-${phpabi}-${arch}-${libc}.tar.gz"
+          # The release archive layout matches what SjI\FfiZts\Installer
+          # expects after extraction: libphp.so at the root, plus the
+          # toolchain bits that ffi-zts-parallel will need to build against.
+          tar czf "$asset" \
+              -C "$PREFIX/lib" libphp.so \
+              -C "$PREFIX" bin include lib/php
+          ls -lh "$asset"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "phpabi=$phpabi" >> "$GITHUB_OUTPUT"
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.asset }}
+          path: ${{ steps.pack.outputs.asset }}
+          retention-days: 7
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/libphp-') || github.event.inputs.release-tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release-tag || github.ref_name }}
+          files: ${{ steps.pack.outputs.asset }}
+          fail_on_unmatched_files: true
