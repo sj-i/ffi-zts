@@ -35,6 +35,13 @@ final class IniBuilder
 
     public static function sapiCdefFragment(): string
     {
+        // Layout must match PHP 8.5's main/SAPI.h:_sapi_module_struct
+        // byte-for-byte. Any field missing from the tail causes FFI::new
+        // to allocate a short buffer; php_module_startup -> sapi_activate
+        // then reads a function pointer past our allocation boundary and
+        // segfaults on the first call. PHP 8.5 added `pre_request_init`
+        // relative to 8.4; future minors may append more, so this block
+        // is the canonical place to keep in sync.
         return <<<EOD
             struct zend_file_handle {
                 uint8_t opaque[80];
@@ -58,7 +65,7 @@ final class IniBuilder
                 char *(*read_cookies)(void);
                 void (*register_server_variables)(void *);
                 void (*log_message)(const char *, int);
-                void (*get_request_time)(double *);
+                int (*get_request_time)(double *);
                 void (*terminate_process)(void);
                 char *php_ini_path_override;
                 void (*default_post_reader)(void);
@@ -76,6 +83,7 @@ final class IniBuilder
                 const char *ini_entries;
                 const void *additional_functions;
                 unsigned int (*input_filter_init)(void);
+                int (*pre_request_init)(void);
             };
         EOD;
     }
