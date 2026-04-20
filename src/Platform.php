@@ -24,13 +24,46 @@ final class Platform
 
     public static function libc(): string
     {
-        $musl = ['/lib/ld-musl-x86_64.so.1', '/lib/ld-musl-aarch64.so.1'];
-        foreach ($musl as $p) {
-            if (is_file($p)) {
-                return 'musl';
+        // Inspect what the running PHP process is actually linked
+        // against, not what files happen to exist on disk. A glibc
+        // host can ship the musl runtime alongside (cross toolchains,
+        // a chroot-able Alpine root, etc.) without itself being a
+        // musl host, and disk presence would misclassify it.
+        $maps = @file_get_contents('/proc/self/maps');
+        if (is_string($maps) && ($detected = self::detectLibcFromMaps($maps)) !== null) {
+            return $detected;
+        }
+        if (function_exists('shell_exec')) {
+            $out = @shell_exec('ldd --version 2>&1');
+            if (is_string($out) && ($detected = self::detectLibcFromLddOutput($out)) !== null) {
+                return $detected;
             }
         }
         return 'glibc';
+    }
+
+    /** @internal exposed for unit tests */
+    public static function detectLibcFromMaps(string $maps): ?string
+    {
+        if (preg_match('#/ld-musl-[^/\s]+\.so\.\d+#', $maps) === 1) {
+            return 'musl';
+        }
+        if (preg_match('#/(?:libc\.so\.6|libc-[\d.]+\.so|ld-linux[^/\s]*\.so\.\d+)#', $maps) === 1) {
+            return 'glibc';
+        }
+        return null;
+    }
+
+    /** @internal exposed for unit tests */
+    public static function detectLibcFromLddOutput(string $output): ?string
+    {
+        if (str_contains($output, 'musl')) {
+            return 'musl';
+        }
+        if (str_contains($output, 'GLIBC') || str_contains($output, 'GNU C')) {
+            return 'glibc';
+        }
+        return null;
     }
 
     public static function assertSupported(): void
