@@ -17,7 +17,12 @@ mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
 if [[ ! -d "parallel-${PARALLEL_VERSION}" ]]; then
-    curl -sL -o parallel.tgz https://pecl.php.net/get/parallel
+    # Pinned URL so the extracted directory matches PARALLEL_VERSION.
+    # The bare `get/parallel` endpoint serves whatever pecl considers
+    # latest, which can drift from this script's pin and make the
+    # subsequent `cd parallel-${PARALLEL_VERSION}` fail.
+    curl -sSLfo parallel.tgz \
+        "https://pecl.php.net/get/parallel-${PARALLEL_VERSION}.tgz"
     tar xzf parallel.tgz
 fi
 
